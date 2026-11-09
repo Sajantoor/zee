@@ -426,6 +426,17 @@ actions!(
         FollowNextCollaborator,
         /// Moves the focused panel to the next position.
         MoveFocusedPanelToNextPosition,
+        /// Moves the active item out of its pane and into its own window.
+        ///
+        /// Works for tabs in the center pane group and items inside dock panels
+        /// (any panel whose `Panel::pane()` returns `Some`). The detached window
+        /// is a normal `Workspace` sharing the same `Project`; state continuity
+        /// comes from sharing the underlying `Entity<T>` directly.
+        MoveActiveItemToNewWindow,
+        /// In a window opened via `MoveActiveItemToNewWindow`, returns the
+        /// active item back to the source workspace's active pane and closes
+        /// the detached window.
+        ReattachActiveItemToSourceWindow,
         /// Creates a new file.
         NewFile,
         /// Creates a new file in a vertical split.
@@ -1651,6 +1662,15 @@ pub struct Workspace {
     persisted_recent_navigation_history: Vec<PathBuf>,
     last_active_project_path: Option<ProjectPath>,
     restoring_workspace: bool,
+    /// Set when this workspace was opened by `MoveActiveItemToNewWindow`.
+    /// Reattach uses this to send the active item back to the source pane.
+    detached_from: Option<DetachedFrom>,
+}
+
+#[derive(Clone)]
+struct DetachedFrom {
+    workspace: WeakEntity<Workspace>,
+    pane: WeakEntity<Pane>,
 }
 
 impl EventEmitter<Event> for Workspace {}
@@ -2154,6 +2174,7 @@ impl Workspace {
             persisted_recent_navigation_history: Vec::new(),
             last_active_project_path: None,
             restoring_workspace: false,
+            detached_from: None,
         }
     }
 
@@ -5847,6 +5868,119 @@ impl Workspace {
         )
     }
 
+    /// Detaches the active item of the focused pane (center pane or a dock-panel's
+    /// inner pane) into a new OS window. The new window contains a fresh
+    /// `Workspace` sharing this workspace's `Project`; the item itself is moved
+    /// (not cloned) and continues to share its underlying entity, so PTYs,
+    /// buffers, and undo history are preserved.
+    pub fn move_active_item_to_new_window(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let source_pane = self.focused_pane(window, cx);
+        let Some(item) = source_pane.read(cx).active_item() else {
+            return;
+        };
+        let item_id = item.item_id();
+        let project = self.project.clone();
+        let app_state = self.app_state.clone();
+        let detached_from = DetachedFrom {
+            workspace: self.weak_self.clone(),
+            pane: source_pane.downgrade(),
+        };
+        let item = item.boxed_clone();
+
+        // The action handler runs inside the source workspace's update closure,
+        // which means the source workspace is currently borrowed. Building a new
+        // window synchronously here would paint before `Pane::AddItem` events
+        // are dispatched, so any element on the moved item would still see the
+        // source workspace as its owner — and reading it would double-lease.
+        // Defer the whole transfer until the current update completes.
+        window.defer(cx, move |window, cx| {
+            let options = (app_state.build_window_options)(None, cx);
+            let result = cx.open_window(options, {
+                let item = item.boxed_clone();
+                move |window, cx| {
+                    let workspace =
+                        cx.new(|cx| Workspace::new(None, project, app_state, window, cx));
+                    workspace.update(cx, |workspace, cx| {
+                        workspace.detached_from = Some(detached_from);
+                        let pane = workspace.active_pane.clone();
+                        pane.update(cx, |pane, cx| {
+                            pane.add_item(item, true, true, None, window, cx);
+                        });
+                    });
+                    cx.new(|cx| MultiWorkspace::new(workspace, window, cx))
+                }
+            });
+
+            let window_handle = match result {
+                Ok(handle) => handle,
+                Err(error) => {
+                    log::error!("failed to open detached item window: {error:#}");
+                    return;
+                }
+            };
+
+            // Production `build_window_options` returns `show: false, focus: false`
+            // so the platform doesn't reveal the window until we explicitly ask.
+            window_handle
+                .update(cx, |_, window, _| window.activate_window())
+                .log_err();
+
+            source_pane.update(cx, |pane, cx| {
+                pane.remove_item(item_id, false, false, window, cx);
+            });
+        });
+    }
+
+    /// Returns the active item to its source workspace and closes this window.
+    /// Has no effect if this workspace was not opened via
+    /// `MoveActiveItemToNewWindow` or if the source no longer exists.
+    pub fn reattach_active_item_to_source_window(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(detached_from) = self.detached_from.clone() else {
+            return;
+        };
+
+        let source_workspace = match detached_from.workspace.upgrade() {
+            Some(workspace) => workspace,
+            None => {
+                window.remove_window();
+                return;
+            }
+        };
+
+        let source_pane = detached_from
+            .pane
+            .upgrade()
+            .or_else(|| Some(source_workspace.read(cx).active_pane.clone()));
+        let Some(source_pane) = source_pane else {
+            window.remove_window();
+            return;
+        };
+
+        let detached_pane = self.active_pane.clone();
+        let Some(active_item) = detached_pane.read(cx).active_item() else {
+            window.remove_window();
+            return;
+        };
+        let item_id = active_item.item_id();
+
+        let destination_index = source_pane.read(cx).items_len();
+        move_item(
+            &detached_pane,
+            &source_pane,
+            item_id,
+            destination_index,
+            true,
+            window,
+            cx,
+        );
+
+        window.remove_window();
+    }
+
     pub fn activate_next_pane(&mut self, window: &mut Window, cx: &mut App) {
         let panes = self.center.panes();
         if let Some(ix) = panes.iter().position(|pane| **pane == self.active_pane) {
@@ -6898,7 +7032,7 @@ impl Workspace {
 
     fn apply_window_title(&mut self, window: &mut Window, cx: &mut App) {
         let project = self.project().read(cx);
-        let active_project_path = self.active_item(cx).and_then(|item| item.project_path(cx));
+        let active_project_path = self.active_project_path(cx);
         let settings = WorkspaceSettings::get_global(cx);
         let template = settings.window_title_format.as_str();
         let separator = settings.window_title_separator.as_str();
@@ -8365,6 +8499,16 @@ impl Workspace {
             .on_action(cx.listener(
                 |workspace, action: &MoveItemToPaneInDirection, window, cx| {
                     workspace.move_item_to_pane_in_direction(action, window, cx)
+                },
+            ))
+            .on_action(
+                cx.listener(|workspace, _: &MoveActiveItemToNewWindow, window, cx| {
+                    workspace.move_active_item_to_new_window(window, cx);
+                }),
+            )
+            .on_action(cx.listener(
+                |workspace, _: &ReattachActiveItemToSourceWindow, window, cx| {
+                    workspace.reattach_active_item_to_source_window(window, cx);
                 },
             ))
             .on_action(cx.listener(|workspace, _: &SwapPaneLeft, _, cx| {

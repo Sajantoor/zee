@@ -1,18 +1,9 @@
 use crate::{
-    CloseWindow, NewCenterTerminal, NewFile, NewTerminal, OpenInTerminal, OpenOptions,
-    OpenTerminal, OpenVisible, SplitDirection, ToggleFileFinder, ToggleProjectSymbols, ToggleZoom,
-    Workspace, WorkspaceItemBuilder, ZoomIn, ZoomOut,
-    focus_follows_mouse::FocusFollowsMouse as _,
-    invalid_item_view::InvalidItemView,
-    item::{
+    CloseWindow, MoveActiveItemToNewWindow, NewCenterTerminal, NewFile, NewTerminal, OpenInTerminal, OpenOptions, OpenTerminal, OpenVisible, SplitDirection, ToggleFileFinder, ToggleProjectSymbols, ToggleZoom, Workspace, WorkspaceItemBuilder, ZoomIn, ZoomOut, focus_follows_mouse::FocusFollowsMouse as _, invalid_item_view::InvalidItemView, item::{
         ActivateOnClose, ClosePosition, Item, ItemBufferKind, ItemHandle, ItemSettings,
         PreviewTabsSettings, ProjectItemKind, SaveOptions, ShowCloseButton, ShowDiagnostics,
         TabContentParams, TabTooltipContent, WeakItemHandle,
-    },
-    move_item,
-    notifications::NotifyResultExt,
-    toolbar::Toolbar,
-    workspace_settings::{AutosaveSetting, FocusFollowsMouse, TabBarSettings, WorkspaceSettings},
+    }, move_item, notifications::NotifyResultExt, toolbar::Toolbar, workspace_settings::{AutosaveSetting, FocusFollowsMouse, TabBarSettings, WorkspaceSettings},
 };
 use anyhow::Result;
 use collections::{BTreeSet, HashMap, HashSet, VecDeque};
@@ -3483,6 +3474,15 @@ impl Pane {
                         } else {
                             menu = menu.map(pin_tab_entries);
                         }
+
+                        menu = menu.separator().entry(
+                            "Move to New Window",
+                            Some(MoveActiveItemToNewWindow.boxed_clone()),
+                            window.handler_for(&pane, move |pane, window, cx| {
+                                pane.activate_item(ix, true, true, window, cx);
+                                window.dispatch_action(MoveActiveItemToNewWindow.boxed_clone(), cx);
+                            }),
+                        );
                     };
 
                     // Add custom item-specific actions

@@ -1201,6 +1201,10 @@ pub struct Editor {
     _scroll_cursor_center_top_bottom_task: Task<()>,
     serialize_selections: Task<()>,
     serialize_folds: Task<()>,
+    /// Bound to the window the editor currently lives in. Replaced (rather
+    /// than detached) on `added_to_workspace` so the editor follows window
+    /// changes — see [`crate::items::Item::added_to_workspace`].
+    _window_activation_subscription: Option<Subscription>,
     minimap: Option<Entity<Self>>,
     pub change_list: ChangeList,
     inline_value_cache: InlineValueCache,
@@ -2567,6 +2571,10 @@ impl Editor {
                     ]
                 })
                 .unwrap_or_default(),
+            // Set lazily by `added_to_workspace`; binding it here would lock
+            // the editor to its construction-time window and leak when the
+            // editor is later moved to another window.
+            _window_activation_subscription: None,
             runnables: RunnableData::new(),
             lsp_data_tasks: HashMap::default(),
             offscreen_lsp_data_tasks: HashMap::default(),
