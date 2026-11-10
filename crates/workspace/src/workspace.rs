@@ -5946,7 +5946,7 @@ impl Workspace {
         let source_workspace = match detached_from.workspace.upgrade() {
             Some(workspace) => workspace,
             None => {
-                window.remove_window();
+                // if the detached workspace is gone, do nothing.
                 return;
             }
         };
@@ -5978,7 +5978,10 @@ impl Workspace {
             cx,
         );
 
-        window.remove_window();
+        // only remove the window if there's no other tabs.
+        if detached_pane.read(cx).items_len() < 1 {
+            window.remove_window();
+        }
     }
 
     pub fn activate_next_pane(&mut self, window: &mut Window, cx: &mut App) {
